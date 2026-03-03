@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 
 
-__version__ = "2.1"
+__version__ = "2.2"
 
 RIMWORLD_APPID_DEFAULT = 294100
 STEAM_COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
@@ -345,6 +345,22 @@ def verify_downloaded(appid: int, wid: str) -> Dict[str, Any]:
     }
 
 
+
+def is_workshop_item_downloaded(appid: int, wid: str) -> bool:
+    """Fast existence check to avoid re-downloading already-present workshop items."""
+    p = content_root(appid) / str(wid)
+    if not (p.exists() and p.is_dir()):
+        return False
+    try:
+        # avoid treating empty dirs as downloaded
+        next(p.iterdir())
+        return True
+    except StopIteration:
+        return False
+    except Exception:
+        return True
+
+
 # ------------------------ RimWorld Mods folder integration ------------------------
 
 def try_read_mod_metadata(item_dir: Path) -> Dict[str, str]:
@@ -523,8 +539,16 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             print(wid)
         return 0
 
+        # Skip items already downloaded in the workshop cache
+    resolved_ids = list(item_ids)
+    already_downloaded = [wid for wid in resolved_ids if is_workshop_item_downloaded(args.appid, wid)]
+    _already_set = set(already_downloaded)
+    item_ids = [wid for wid in resolved_ids if wid not in _already_set]
+
+    if already_downloaded and verbose >= 1:
+        print(f"[INFO] Skipping {len(already_downloaded)} already-downloaded item(s).")
     if verbose >= 1:
-        print(f"[INFO] Total workshop items to download: {len(item_ids)}")
+        print(f"[INFO] Workshop items resolved: {len(resolved_ids)} | To download: {len(item_ids)}")
 
     username = args.username
     password: Optional[str] = None
@@ -542,11 +566,18 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         "steamcmd": str(steamcmd_exe),
         "appid": args.appid,
+        "resolved_item_count": len(resolved_ids),
+        "already_downloaded_count": len(already_downloaded),
         "workshop_item_count": len(item_ids),
+        "already_downloaded": list(already_downloaded),
         "batches": [],
         "items": {},
         "notes": [],
     }
+
+    # Pre-fill report for items already present on disk
+    for wid in already_downloaded:
+        report["items"][wid] = verify_downloaded(args.appid, wid)
 
     any_fail = False
 
@@ -616,7 +647,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8", errors="replace")
 
     success_count = sum(1 for v in report["items"].values() if v.get("exists"))
-    print(f"\nDone. Verified {success_count}/{len(item_ids)} item folders.")
+    print(f"\nDone. Verified {success_count}/{len(resolved_ids)} item folders.")
     print(f"Workshop content folder: {content_root(args.appid)}")
     print(f"Report written to: {out_path}")
     print(f"Logs folder: {logs_dir()}")
@@ -726,7 +757,11 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                 continue
             if wid in queue_items:
                 continue
-            queue_items[wid] = QueueItem(workshop_id=wid, source=source)
+            qi = QueueItem(workshop_id=wid, source=source)
+            if is_workshop_item_downloaded(appid, wid):
+                qi.status = "done"
+                qi.message = "Already downloaded"
+            queue_items[wid] = qi
             ui_events.put(("queue_add", queue_items[wid]))
             added += 1
         if added:
@@ -804,15 +839,29 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
             running["active"] = True
             stop_event.clear()
 
-            pending = [wid for wid, qi in queue_items.items() if qi.status in ("queued", "failed", "stopped")]
-            if not pending:
+            pending_all = [wid for wid, qi in queue_items.items() if qi.status in ("queued", "failed", "stopped")]
+            if not pending_all:
                 ui_events.put(("info", "Nothing to download."))
                 running["active"] = False
                 return
 
-            total = len(pending)
+            # Mark already-downloaded items as done and skip sending them to SteamCMD
+            pending: List[str] = []
             done_count = 0
+            for wid in pending_all:
+                if is_workshop_item_downloaded(appid, wid):
+                    set_status(wid, "done", "Already downloaded")
+                    done_count += 1
+                else:
+                    pending.append(wid)
+
+            total = len(pending_all)
             ui_events.put(("progress", (done_count, total)))
+
+            if not pending:
+                ui_events.put(("info", "All queued items are already downloaded."))
+                running["active"] = False
+                return
 
             for batch in chunked(pending, max(1, int(batch_size_var.get()))):
                 if stop_event.is_set():
@@ -873,6 +922,15 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                         verbose=0,
                         stop_event=stop_event,
                     )
+
+                    # If log level is high, show SteamCMD output tail in GUI log
+                    if verbose_var.get() >= 3:
+                        try:
+                            txt = log_file.read_text(encoding="utf-8", errors="replace")
+                            tail = "\n".join(txt.splitlines()[-80:])
+                            ui_log("[STEAMCMD LOG TAIL]\n" + tail, 3)
+                        except Exception:
+                            pass
 
                     combined_out = (result.get("stdout", "") + "\n" + result.get("stderr", ""))
                     if login_mode == "user" and looks_like_steam_guard(combined_out):
@@ -1054,7 +1112,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
     _spin(settings_row, "API timeout:", api_timeout_var, frm=5, to=120).pack(side="left", padx=(0, 12))
     _spin(settings_row, "Collection depth:", collection_depth_var, frm=1, to=5).pack(side="left", padx=(0, 12))
 
-    ttk.Label(settings_row, text="Verbose:").pack(side="left")
+    ttk.Label(settings_row, text="Log level:").pack(side="left")
     ttk.Combobox(settings_row, values=[0, 1, 2, 3], width=3, state="readonly", textvariable=verbose_var).pack(side="left", padx=(6, 18))
 
     ttk.Label(settings_row, text="Login:").pack(side="left")
@@ -1206,6 +1264,61 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
             messagebox.showinfo("Not found", f"Folder not found:\n{p}")
 
     ttk.Button(lib_ctrl, text="Open selected workshop folder", command=lambda: open_selected_workshop(not_loaded_tree)).pack(side="left", padx=12)
+
+    def select_all(tv):
+        tv.selection_set(tv.get_children())
+
+    def clear_all_selections():
+        not_loaded_tree.selection_remove(not_loaded_tree.selection())
+        loaded_tree.selection_remove(loaded_tree.selection())
+
+    def delete_selected_downloaded():
+        mods_path = validate_rimworld_folder()
+        if mods_path is None:
+            return
+        ids = get_selected_ids(not_loaded_tree)
+        if not ids:
+            return
+
+        loaded_now = set(list_loaded_items(mods_path))
+        safe = [wid for wid in ids if wid not in loaded_now]
+        blocked = [wid for wid in ids if wid in loaded_now]
+
+        if blocked:
+            messagebox.showwarning(
+                "Cannot delete loaded mods",
+                "These are loaded into your RimWorld Mods folder and will NOT be deleted:\n" + "\n".join(blocked),
+            )
+
+        if not safe:
+            return
+
+        if not messagebox.askyesno(
+            "Delete downloaded mods",
+            f"Delete {len(safe)} downloaded mod folder(s) from the workshop cache?\n\n"
+            "This does NOT touch your RimWorld Mods folder.",
+        ):
+            return
+
+        deleted = 0
+        for wid in safe:
+            p = content_root(appid) / wid
+            try:
+                if p.exists() and p.is_dir():
+                    shutil.rmtree(p)
+                    deleted += 1
+                    ui_log(f"[DELETE] {wid}: deleted from workshop cache", 1)
+            except Exception as e:
+                ui_log(f"[DELETE] {wid}: failed ({e})", 1)
+
+        ui_events.put(("info", f"Deleted {deleted}/{len(safe)} from workshop cache."))
+        ui_events.put(("library_refresh_request", None))
+
+    ttk.Separator(lib_ctrl, orient="vertical").pack(side="left", fill="y", padx=10)
+    ttk.Button(lib_ctrl, text="Select all (downloaded)", command=lambda: select_all(not_loaded_tree)).pack(side="left", padx=6)
+    ttk.Button(lib_ctrl, text="Select all (loaded)", command=lambda: select_all(loaded_tree)).pack(side="left", padx=6)
+    ttk.Button(lib_ctrl, text="Clear selection", command=clear_all_selections).pack(side="left", padx=6)
+    ttk.Button(lib_ctrl, text="Delete selected (downloaded)", command=delete_selected_downloaded).pack(side="left", padx=12)
 
     # -------- event processing --------
     def upsert_queue_row(qi: QueueItem):
