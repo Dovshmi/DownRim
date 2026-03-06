@@ -45,7 +45,7 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 
 
-__version__ = "2.3"
+__version__ = "2.4"
 
 RIMWORLD_APPID_DEFAULT = 294100
 STEAM_COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
@@ -470,6 +470,28 @@ def list_loaded_items(mods_dir: Path) -> List[str]:
     return out
 
 
+def export_workshop_id_list(ids: List[str], out_path: Path, title: str = "RimWorld workshop mod ID export", source_path: Optional[Path] = None) -> Path:
+    unique_ids = sorted({str(x).strip() for x in ids if str(x).strip().isdigit()}, key=lambda s: int(s))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header = [
+        f"# {title}",
+        f"# Generated: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"# Count: {len(unique_ids)}",
+    ]
+    if source_path is not None:
+        header.append(f"# Source folder: {source_path}")
+    header.append("")
+
+    content = "\n".join(header + unique_ids)
+    if content and not content.endswith("\n"):
+        content += "\n"
+
+    out_path.write_text(content, encoding="utf-8", errors="replace")
+    return out_path
+
+
 # ------------------------ CLI mode ------------------------
 
 def cli_main(argv: Optional[List[str]] = None) -> int:
@@ -495,6 +517,9 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="Do not run SteamCMD; only print/record what would run.")
     ap.add_argument("--list", action="store_true", help="Only parse and print IDs, then exit (no download).")
 
+    ap.add_argument("--mods-dir", type=str, default=None, help="Path to the RimWorld Mods folder (used by export helpers).")
+    ap.add_argument("--export-installed", type=str, default=None, metavar="FILE", help="Export installed Workshop mod IDs from --mods-dir into a text file, one ID per line.")
+
     ap.add_argument("--login", choices=["anonymous", "user"], default="anonymous", help="Login method (default: anonymous).")
     ap.add_argument("--username", type=str, default=None, help="Steam username (required if --login user).")
 
@@ -503,6 +528,25 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
 
     if args.gui:
         return gui_main(args)
+
+    if args.export_installed:
+        if not args.mods_dir:
+            ap.error("--export-installed requires --mods-dir pointing to your RimWorld Mods folder.")
+        mods_dir = Path(args.mods_dir).expanduser()
+        if not mods_dir.exists() or not mods_dir.is_dir():
+            print(f"[ERROR] Mods folder not found: {mods_dir}", file=sys.stderr)
+            return 2
+        installed_ids = list_loaded_items(mods_dir)
+        out_file = Path(args.export_installed).expanduser()
+        export_workshop_id_list(
+            installed_ids,
+            out_file,
+            title="RimWorld installed Workshop mod IDs",
+            source_path=mods_dir,
+        )
+        print(f"[OK] Exported {len(installed_ids)} installed Workshop mod ID(s) to: {out_file}")
+        if not args.links and not args.infile and not args.collection:
+            return 0
 
     if not args.links and not args.infile and not args.collection:
         ap.error("You must provide at least one input source: --links, --in, or --collection (or use --gui).")
@@ -1324,6 +1368,35 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
             messagebox.showinfo("RimWorld Mods folder", target)
 
     ttk.Button(lib_top, text="Open RimWorld Mods folder", command=open_rimworld_mods_folder).pack(side="left", padx=6)
+
+    def export_loaded_mod_list() -> None:
+        mods_path = validate_rimworld_folder()
+        if mods_path is None:
+            return
+        ids = list_loaded_items(mods_path)
+        default_name = f"rimworld_installed_mod_ids_{now_stamp()}.txt"
+        save_path = filedialog.asksaveasfilename(
+            title="Export installed Workshop mod IDs",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not save_path:
+            return
+        out_file = export_workshop_id_list(
+            ids,
+            Path(save_path),
+            title="RimWorld installed Workshop mod IDs",
+            source_path=mods_path,
+        )
+        ui_log(f"[EXPORT] Installed mod ID list saved: {out_file} ({len(ids)} item(s))", 1)
+        messagebox.showinfo(
+            "Export completed",
+            f"Saved {len(ids)} installed Workshop mod ID(s) to:\n{out_file}\n\nYou can later feed this file back into the downloader with --in.",
+        )
+
+    ttk.Button(lib_top, text="Export installed ID list...", command=export_loaded_mod_list).pack(side="left", padx=6)
+
 
     lib_mid = ttk.Frame(tab_library)
     lib_mid.pack(fill="both", expand=True, padx=8, pady=8)
