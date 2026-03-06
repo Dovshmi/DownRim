@@ -32,6 +32,7 @@ import os
 import queue as _queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -44,7 +45,7 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 
 
-__version__ = "2.2"
+__version__ = "2.3"
 
 RIMWORLD_APPID_DEFAULT = 294100
 STEAM_COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
@@ -130,6 +131,78 @@ def sanitize_steamcmd_args(args: List[str]) -> List[str]:
     except ValueError:
         pass
     return out
+
+
+def open_path(pathish: Any) -> bool:
+    p = Path(pathish)
+    target = str(p)
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+        return True
+    except Exception:
+        return False
+
+
+def inspect_workshop_item(appid: int, wid: str) -> Dict[str, Any]:
+    mod_dir = content_root(appid) / str(wid)
+    exists = mod_dir.exists() and mod_dir.is_dir()
+    file_count = 0
+    total_bytes = 0
+    has_about_xml = False
+    has_common_mod_dir = False
+
+    if exists:
+        about_xml = mod_dir / "About" / "About.xml"
+        has_about_xml = about_xml.exists() and about_xml.is_file()
+        common_dirs = {"About", "Assemblies", "Defs", "Languages", "Patches", "Textures", "Sounds", "Source"}
+        try:
+            for child in mod_dir.iterdir():
+                if child.is_dir() and child.name in common_dirs:
+                    has_common_mod_dir = True
+                    break
+        except Exception:
+            pass
+
+        try:
+            for p in mod_dir.rglob("*"):
+                if p.is_file():
+                    file_count += 1
+                    try:
+                        total_bytes += p.stat().st_size
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    is_valid_mod = exists and file_count > 0 and (has_about_xml or (has_common_mod_dir and file_count >= 5 and total_bytes > 1024))
+
+    if not exists:
+        reason = "folder_missing"
+    elif file_count == 0:
+        reason = "empty_folder"
+    elif has_about_xml:
+        reason = "about_xml_found"
+    elif has_common_mod_dir and file_count >= 5 and total_bytes > 1024:
+        reason = "common_mod_structure_found"
+    else:
+        reason = "incomplete_or_unrecognized_structure"
+
+    return {
+        "workshop_id": str(wid),
+        "path": str(mod_dir),
+        "exists": exists,
+        "file_count": file_count,
+        "bytes": total_bytes,
+        "has_about_xml": has_about_xml,
+        "has_common_mod_dir": has_common_mod_dir,
+        "is_valid_mod": is_valid_mod,
+        "reason": reason,
+    }
 
 
 # ------------------------ Steam Web API (collections) ------------------------
@@ -321,44 +394,12 @@ def run_steamcmd_batch(
 
 
 def verify_downloaded(appid: int, wid: str) -> Dict[str, Any]:
-    mod_dir = content_root(appid) / wid
-    ok = mod_dir.exists() and mod_dir.is_dir()
-    size = 0
-    file_count = 0
-    if ok:
-        try:
-            for p in mod_dir.rglob("*"):
-                if p.is_file():
-                    file_count += 1
-                    try:
-                        size += p.stat().st_size
-                    except OSError:
-                        pass
-        except Exception:
-            pass
-    return {
-        "workshop_id": wid,
-        "path": str(mod_dir),
-        "exists": ok,
-        "file_count": file_count,
-        "bytes": size,
-    }
-
+    return inspect_workshop_item(appid, wid)
 
 
 def is_workshop_item_downloaded(appid: int, wid: str) -> bool:
-    """Fast existence check to avoid re-downloading already-present workshop items."""
-    p = content_root(appid) / str(wid)
-    if not (p.exists() and p.is_dir()):
-        return False
-    try:
-        # avoid treating empty dirs as downloaded
-        next(p.iterdir())
-        return True
-    except StopIteration:
-        return False
-    except Exception:
-        return True
+    """Treat an item as downloaded only when the folder looks like a real RimWorld mod."""
+    return bool(inspect_workshop_item(appid, wid).get("is_valid_mod"))
 
 
 # ------------------------ RimWorld Mods folder integration ------------------------
@@ -722,10 +763,13 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
     appid = int(getattr(parsed_args, "appid", RIMWORLD_APPID_DEFAULT) or RIMWORLD_APPID_DEFAULT)
 
     ui_events: "_queue.Queue[Tuple[str, Any]]" = _queue.Queue()
+    password_queue: "_queue.Queue[str]" = _queue.Queue()
     stop_event = threading.Event()
     worker_thread: Optional[threading.Thread] = None
     queue_items: Dict[str, QueueItem] = {}
     running = {"active": False}
+    last_log_file: Dict[str, Optional[Path]] = {"path": None}
+    log_history: List[Tuple[str, str]] = []
 
     # tk variables (now safe because root exists)
     rimworld_mods_dir = tk.StringVar(master=root, value=cfg.get("rimworld_mods_dir", ""))
@@ -845,18 +889,17 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                 running["active"] = False
                 return
 
-            # Mark already-downloaded items as done and skip sending them to SteamCMD
             pending: List[str] = []
-            done_count = 0
+            counters = {"done": 0, "failed": 0, "skipped": 0, "stopped": 0, "total": len(pending_all)}
+
             for wid in pending_all:
                 if is_workshop_item_downloaded(appid, wid):
                     set_status(wid, "done", "Already downloaded")
-                    done_count += 1
+                    counters["skipped"] += 1
                 else:
                     pending.append(wid)
 
-            total = len(pending_all)
-            ui_events.put(("progress", (done_count, total)))
+            ui_events.put(("progress", dict(counters)))
 
             if not pending:
                 ui_events.put(("info", "All queued items are already downloaded."))
@@ -879,22 +922,26 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                         ui_events.put(("error", "Login mode is 'user' but username is empty."))
                         for wid in batch:
                             set_status(wid, "failed", "Missing username")
+                            counters["failed"] += 1
+                        ui_events.put(("progress", dict(counters)))
                         continue
-                    ui_events.put(("ask_password", None))
-                    pw = None
-                    while pw is None and not stop_event.is_set():
+
+                    while True:
                         try:
-                            typ, payload = ui_events.get(timeout=0.2)
+                            password_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                    ui_events.put(("ask_password", None))
+
+                    while not stop_event.is_set():
+                        try:
+                            password = password_queue.get(timeout=0.2)
+                            break
                         except _queue.Empty:
                             continue
-                        if typ == "password":
-                            pw = payload
-                        else:
-                            ui_events.put((typ, payload))
-                            time.sleep(0.05)
+
                     if stop_event.is_set():
                         break
-                    password = pw
 
                 steamcmd_args = build_steamcmd_args(
                     steamcmd_exe=steamcmd_exe,
@@ -905,6 +952,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                     ids=batch,
                 )
 
+                result: Optional[Dict[str, Any]] = None
                 attempt = 0
                 while attempt <= max(0, int(retries_var.get())):
                     if stop_event.is_set():
@@ -912,6 +960,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                     attempt += 1
                     stamp = now_stamp()
                     log_file = ld / f"steamcmd_gui_batch_{stamp}_attempt{attempt}.log"
+                    last_log_file["path"] = log_file
                     ui_log(f"[BATCH] Running SteamCMD for {len(batch)} item(s) (attempt {attempt})", 2)
 
                     result = run_steamcmd_batch(
@@ -923,12 +972,12 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                         stop_event=stop_event,
                     )
 
-                    # If log level is high, show SteamCMD output tail in GUI log
                     if verbose_var.get() >= 3:
                         try:
                             txt = log_file.read_text(encoding="utf-8", errors="replace")
                             tail = "\n".join(txt.splitlines()[-80:])
-                            ui_log("[STEAMCMD LOG TAIL]\n" + tail, 3)
+                            if tail.strip():
+                                ui_events.put(("log", "[STEAMCMD LOG TAIL]\n" + tail))
                         except Exception:
                             pass
 
@@ -940,18 +989,28 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                     if result["returncode"] == 0:
                         break
 
+                batch_failed = bool(result and result.get("returncode") != 0)
+
                 for wid in batch:
                     if stop_event.is_set():
                         set_status(wid, "stopped", "Stopped")
+                        counters["stopped"] += 1
                         continue
-                    v = verify_downloaded(appid, wid)
-                    if v["exists"]:
-                        set_status(wid, "done", "Downloaded")
-                    else:
-                        set_status(wid, "failed", "Not found after download")
 
-                done_count += len(batch)
-                ui_events.put(("progress", (min(done_count, total), total)))
+                    v = verify_downloaded(appid, wid)
+                    if v["exists"] and v.get("is_valid_mod"):
+                        set_status(wid, "done", "Downloaded")
+                        counters["done"] += 1
+                    else:
+                        msg = "Not found after download"
+                        if v["exists"] and not v.get("is_valid_mod"):
+                            msg = f"Incomplete download ({v.get('reason', 'structure check failed')})"
+                        elif batch_failed:
+                            msg = "SteamCMD failed for batch"
+                        set_status(wid, "failed", msg)
+                        counters["failed"] += 1
+
+                ui_events.put(("progress", dict(counters)))
 
             if stop_event.is_set():
                 ui_events.put(("info", "Download stopped."))
@@ -1175,9 +1234,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
         if not p.exists():
             messagebox.showinfo("Workshop folder", f"Workshop folder does not exist yet:\n{p}")
             return
-        try:
-            os.startfile(str(p))
-        except Exception:
+        if not open_path(p):
             messagebox.showinfo("Workshop folder", str(p))
 
     ttk.Button(ctrl_frame, text="Open workshop folder", command=open_workshop_folder).pack(fill="x", pady=(0, 6))
@@ -1188,27 +1245,85 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
     progress_var = tk.DoubleVar(value=0.0)
     ttk.Progressbar(bottom_frame, variable=progress_var, maximum=100.0).pack(fill="x", padx=2)
 
-    progress_label = ttk.Label(bottom_frame, text="0 / 0")
+    progress_label = ttk.Label(bottom_frame, text="Processed 0 / 0 | Done: 0 | Failed: 0 | Skipped: 0 | Stopped: 0")
     progress_label.pack(anchor="w", padx=2, pady=(2, 6))
 
     log_frame = ttk.LabelFrame(bottom_frame, text="Log")
     log_frame.pack(fill="both", expand=True)
+
+    log_controls = ttk.Frame(log_frame)
+    log_controls.pack(fill="x", padx=6, pady=(6, 0))
+
+    log_filter_var = tk.StringVar(master=root, value="all")
+
+    def infer_log_category(s: str) -> str:
+        up = (s or "").upper()
+        if "[STEAMCMD" in up:
+            return "steamcmd"
+        if "[ERROR" in up:
+            return "error"
+        if "[WARN" in up:
+            return "warn"
+        return "info"
+
+    def redraw_log_view() -> None:
+        current = log_filter_var.get()
+        log_text.delete("1.0", "end")
+        for category, entry in log_history:
+            if current != "all" and category != current:
+                continue
+            log_text.insert("end", entry + "\n")
+        log_text.see("end")
+
+    def append_log(s: str):
+        log_history.append((infer_log_category(s), s))
+        redraw_log_view()
+
+    def set_log_filter(value: str) -> None:
+        log_filter_var.set(value)
+        redraw_log_view()
+
+    def clear_log() -> None:
+        log_history.clear()
+        redraw_log_view()
+
+    def open_logs_folder() -> None:
+        if not open_path(ld):
+            messagebox.showinfo("Logs folder", str(ld))
+
+    def open_latest_log() -> None:
+        p = last_log_file.get("path")
+        if p and p.exists():
+            if not open_path(p):
+                messagebox.showinfo("Latest log", str(p))
+        else:
+            messagebox.showinfo("Latest log", "No SteamCMD log has been created yet.")
+
+    for label, filt in [("All", "all"), ("Info", "info"), ("Warnings", "warn"), ("Errors", "error"), ("SteamCMD", "steamcmd")]:
+        ttk.Button(log_controls, text=label, command=lambda f=filt: set_log_filter(f)).pack(side="left", padx=(0, 4))
+    ttk.Button(log_controls, text="Clear", command=clear_log).pack(side="left", padx=(8, 4))
+    ttk.Button(log_controls, text="Open latest log", command=open_latest_log).pack(side="left", padx=4)
+    ttk.Button(log_controls, text="Open logs folder", command=open_logs_folder).pack(side="left", padx=4)
+
     log_text = tk.Text(log_frame, height=8, wrap="word")
     log_text.pack(side="left", fill="both", expand=True, padx=6, pady=6)
     log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log_text.yview)
     log_text.configure(yscrollcommand=log_scroll.set)
     log_scroll.pack(side="right", fill="y")
 
-    def append_log(s: str):
-        log_text.insert("end", s + "\n")
-        log_text.see("end")
-
     # Library tab
     lib_top = ttk.Frame(tab_library)
     lib_top.pack(fill="x", pady=8, padx=8)
 
     ttk.Button(lib_top, text="Refresh", command=refresh_library).pack(side="left")
-    ttk.Button(lib_top, text="Open RimWorld Mods folder", command=lambda: os.startfile(rimworld_mods_dir.get()) if rimworld_mods_dir.get() else None).pack(side="left", padx=6)
+    def open_rimworld_mods_folder() -> None:
+        target = (rimworld_mods_dir.get() or "").strip()
+        if not target:
+            return
+        if not open_path(target):
+            messagebox.showinfo("RimWorld Mods folder", target)
+
+    ttk.Button(lib_top, text="Open RimWorld Mods folder", command=open_rimworld_mods_folder).pack(side="left", padx=6)
 
     lib_mid = ttk.Frame(tab_library)
     lib_mid.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1256,9 +1371,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
             return
         p = content_root(appid) / ids[0]
         if p.exists():
-            try:
-                os.startfile(str(p))
-            except Exception:
+            if not open_path(p):
                 messagebox.showinfo("Path", str(p))
         else:
             messagebox.showinfo("Not found", f"Folder not found:\n{p}")
@@ -1343,14 +1456,28 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
         fill(not_loaded_tree, not_loaded)
         fill(loaded_tree, loaded_list)
 
-    def set_progress(done: int, total: int):
+    def set_progress(payload: Any):
+        if isinstance(payload, tuple):
+            done, total = payload
+            payload = {"done": int(done), "failed": 0, "skipped": 0, "stopped": 0, "total": int(total)}
+
+        total = int(payload.get("total", 0))
+        done = int(payload.get("done", 0))
+        failed = int(payload.get("failed", 0))
+        skipped = int(payload.get("skipped", 0))
+        stopped = int(payload.get("stopped", 0))
+        processed = done + failed + skipped + stopped
+
         if total <= 0:
             progress_var.set(0.0)
-            progress_label.configure(text="0 / 0")
+            progress_label.configure(text="Processed 0 / 0 | Done: 0 | Failed: 0 | Skipped: 0 | Stopped: 0")
             return
-        pct = max(0.0, min(100.0, (done / total) * 100.0))
+
+        pct = max(0.0, min(100.0, (processed / total) * 100.0))
         progress_var.set(pct)
-        progress_label.configure(text=f"{done} / {total}")
+        progress_label.configure(
+            text=f"Processed {processed} / {total} | Done: {done} | Failed: {failed} | Skipped: {skipped} | Stopped: {stopped}"
+        )
 
     def poll_events():
         try:
@@ -1363,8 +1490,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                 elif typ == "queue_update":
                     upsert_queue_row(payload)
                 elif typ == "progress":
-                    done, total = payload
-                    set_progress(done, total)
+                    set_progress(payload)
                 elif typ == "info":
                     append_log("[INFO] " + str(payload))
                 elif typ == "error":
@@ -1372,7 +1498,7 @@ def gui_main(parsed_args: argparse.Namespace) -> int:
                     messagebox.showerror("Error", str(payload))
                 elif typ == "ask_password":
                     pw = simpledialog.askstring("Steam Login", "Steam password:", show="*")
-                    ui_events.put(("password", pw or ""))
+                    password_queue.put(pw or "")
                 elif typ == "worker_done":
                     append_log("[INFO] Worker finished.")
                 elif typ == "library_refresh":
